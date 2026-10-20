@@ -81,9 +81,9 @@ async def _solve(pool, stop, workers: int, block_and_key: bytes, budget: float):
     return solved
 
 
-async def drip(client, pool, stop, workers: int, wallet, budget: float, max_attempts: int) -> int:
-    """Land one faucet call for ``wallet``; return how many attempts it took."""
-    pubkey = wallet.coldkey.public_key
+async def drip(client, pool, stop, workers: int, name: str, coldkey, budget: float, max_attempts: int) -> int:
+    """Land one faucet call signed by the unlocked ``coldkey``; return how many attempts it took."""
+    pubkey = coldkey.public_key
     for attempt in range(1, max_attempts + 1):
         head = await client.block_info()
         block_and_key = _keccak(bytes.fromhex(head.hash.removeprefix("0x")) + pubkey)
@@ -97,7 +97,10 @@ async def drip(client, pool, stop, workers: int, wallet, budget: float, max_atte
             {"block_number": head.number, "nonce": nonce, "work": "0x" + work.hex()},
         )
         try:
-            result = await client.submit_call(call, wallet, wait_for_finalization=False)
+            # Sign with the already-unlocked keypair. Passing the Wallet makes the SDK wrap it
+            # in a fresh WalletSigner that prompts for the password inside sign(), blocking
+            # the event loop mid-submission (dropped connection, stale signed payload).
+            result = await client.submit_call(call, coldkey, wait_for_finalization=False)
             error = result.error
         except ChainError as raised:
             result, error = None, raised
@@ -105,8 +108,8 @@ async def drip(client, pool, stop, workers: int, wallet, budget: float, max_atte
             return attempt
         if error is None or error.name not in STALE_WORK_ERRORS:
             message = error.message if error else result.message
-            raise SystemExit(f"faucet call failed for {wallet.name}: {message}")
-    raise SystemExit(f"no faucet call landed for {wallet.name} after {max_attempts} attempts")
+            raise SystemExit(f"faucet call failed for {name}: {message}")
+    raise SystemExit(f"no faucet call landed for {name} after {max_attempts} attempts")
 
 
 def parse_target(spec: str) -> tuple[str, int]:
@@ -117,17 +120,17 @@ def parse_target(spec: str) -> tuple[str, int]:
 
 
 async def main(args: argparse.Namespace) -> None:
-    wallets = []
+    coldkeys = []
     for name, calls in args.targets:
-        wallet = bt.Wallet(name, path=args.wallet_path)
         try:
-            _ = wallet.coldkey  # unlock (password prompt) before any mining starts
+            # The single password prompt per wallet, before any mining starts.
+            coldkey = bt.Wallet(name, path=args.wallet_path).coldkey
         except Exception as error:
             raise SystemExit(
                 f"cannot load coldkey for wallet {name!r} under {args.wallet_path}: {error}\n"
                 f"create it with: btcli wallet create -w {name} -H default"
             ) from None
-        wallets.append((wallet, calls))
+        coldkeys.append((name, coldkey, calls))
 
     client = bt.Client(args.network, fallback_endpoints=[], archive_endpoints=[])
     await client.connect()
@@ -149,14 +152,14 @@ async def main(args: argparse.Namespace) -> None:
             args.workers, mp_context=ctx, initializer=_init_worker, initargs=(stop,)
         ) as pool:
             print(f"{args.network}: {block_time}s blocks, {args.workers} mining workers")
-            for wallet, calls in wallets:
-                ss58 = wallet.coldkeypub.ss58_address
+            for name, coldkey, calls in coldkeys:
                 for n in range(1, calls + 1):
                     attempts = await drip(
-                        client, pool, stop, args.workers, wallet, budget, args.max_attempts
+                        client, pool, stop, args.workers, name, coldkey, budget, args.max_attempts
                     )
-                    print(f"  {wallet.name}: +{FAUCET_TAO_PER_CALL} TAO ({n}/{calls}, {attempts} attempt(s))")
-                print(f"  {wallet.name} {ss58} balance {await client.balances.get(ss58)}")
+                    print(f"  {name}: +{FAUCET_TAO_PER_CALL} TAO ({n}/{calls}, {attempts} attempt(s))")
+                ss58 = coldkey.ss58_address
+                print(f"  {name} {ss58} balance {await client.balances.get(ss58)}")
     finally:
         await client.close()
 
